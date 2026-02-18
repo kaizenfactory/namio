@@ -6,17 +6,17 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/NicolaiSchmid/namio.git"
+    "url": "git+https://github.com/kaizenfactory/namio.git"
   },
   "bugs": {
-    "url": "https://github.com/NicolaiSchmid/namio/issues"
+    "url": "https://github.com/kaizenfactory/namio/issues"
   },
-  "homepage": "https://github.com/NicolaiSchmid/namio#readme",
+  "homepage": "https://github.com/kaizenfactory/namio#readme",
   "publishConfig": {
     "access": "public"
   },
   "bin": {
-    "namio": "src/cli.ts"
+    "namio": "dist/namio.js"
   },
   "files": [
     "src",
@@ -29,7 +29,8 @@
     "generate": "bun run src/cli.ts generate",
     "check": "bun run src/cli.ts check",
     "hunt": "bun run src/cli.ts hunt",
-    "build": "bun build src/cli.ts --outfile dist/namio.js",
+    "build": "bun build src/cli.ts --target=node --outfile dist/namio.js && node scripts/add-shebang.mjs dist/namio.js",
+    "prepack": "bun run build",
     "compile": "bun build --compile src/cli.ts --outfile dist/namio"
   },
   "dependencies": {

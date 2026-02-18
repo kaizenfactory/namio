@@ -22,3 +22,9 @@ jobs:
 
       - name: Typecheck
         run: bun run tsc --noEmit
+
+      - name: Build (node)
+        run: bun run build
+
+      - name: Smoke test
+        run: node dist/namio.js --help

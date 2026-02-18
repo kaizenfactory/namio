@@ -6,6 +6,7 @@ on:
       - "v*"
 
 permissions:
+  id-token: write
   contents: read
 
 jobs:
@@ -17,7 +18,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           registry-url: "https://registry.npmjs.org"
 
       - uses: oven-sh/setup-bun@v2
@@ -30,7 +31,11 @@ jobs:
       - name: Typecheck
         run: bun run tsc --noEmit
 
+      - name: Build (node)
+        run: bun run build
+
+      - name: Smoke test
+        run: node dist/namio.js --help
+
       - name: Publish
-        run: npm publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public

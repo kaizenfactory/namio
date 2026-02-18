@@ -4,7 +4,7 @@ Brandable name generator + `.com` availability checker, inspired by Attio's nami
 
 ## Install / Run
 
-This is a Bun-first CLI.
+This CLI is published to npm and runs on Node (no Bun required).
 
 ```bash
 # one-off
