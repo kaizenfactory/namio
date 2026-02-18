@@ -31,7 +31,9 @@
     "hunt": "bun run src/cli.ts hunt",
     "build": "bun build src/cli.ts --target=node --outfile dist/namio.js && node scripts/add-shebang.mjs dist/namio.js",
     "prepack": "bun run build",
-    "compile": "bun build --compile src/cli.ts --outfile dist/namio"
+    "compile": "bun build --compile src/cli.ts --outfile dist/namio",
+    "release": "standard-version",
+    "release:dry": "standard-version --dry-run"
   },
   "dependencies": {
     "chalk": "^5.6.2",
@@ -39,6 +41,7 @@
   },
   "devDependencies": {
     "@types/bun": "latest",
+    "standard-version": "^9.5.0",
     "typescript": "^5.6.3"
   }
 }
