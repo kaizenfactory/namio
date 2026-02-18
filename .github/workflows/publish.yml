@@ -13,6 +13,9 @@ jobs:
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
+    environment: production
+    env:
+      NODE_AUTH_TOKEN: ""
     steps:
       - uses: actions/checkout@v4
 
@@ -38,4 +41,4 @@ jobs:
         run: node dist/namio.js --help
 
       - name: Publish
-        run: npm publish --provenance --access public
+        run: npm publish --access public
