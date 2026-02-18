@@ -17,6 +17,8 @@ export type IDSResult = {
 };
 
 export type DomainInfo = {
+  name: string;
+  tld: string;
   available: boolean;
   purchasable: boolean;
   priceUSD: number | null;
@@ -95,7 +97,10 @@ export async function checkDomainsViaIDS(params: {
 
     const purchasable = !isFree && cheapestUSD !== null && cheapestUSD <= maxPriceUSD;
 
-    result.set(r.label, {
+    const key = `${r.label}.${r.tld}`;
+    result.set(key, {
+      name: r.label,
+      tld: r.tld,
       available: isFree,
       purchasable,
       priceUSD: cheapestUSD,

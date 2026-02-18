@@ -6,10 +6,11 @@ import { readFile, writeFile } from "node:fs/promises";
 import { generateCandidates } from "./generator";
 import { normalizeName } from "./util";
 import { parseCsvFirstColumn, toCsv } from "./csv";
-import { checkDomainsViaIDS } from "./domain/ids";
+import { checkDomainsViaIDS, type DomainInfo } from "./domain/ids";
 
 type DomainRow = {
   name: string;
+  tld: string;
   domain: string;
   status: "FREE" | "BUY" | "TAKEN" | "ERROR";
   priceUSD: number | null;
@@ -32,7 +33,15 @@ const DEFAULT_SEEDS = [
 ];
 
 const program = new Command();
-program.name("namio").description("Brandable name generator + .com checker").version("0.0.1");
+const DEFAULT_TLDS = ["com"];
+
+const parseTlds = (value: string): string[] =>
+  value
+    .split(/[\s,]+/)
+    .map((s) => s.trim().replace(/^\./, ""))
+    .filter(Boolean);
+
+program.name("namio").description("Brandable name generator + domain availability checker").version("0.0.1");
 
 const IDS_BATCH_SIZE = 25;
 
@@ -70,13 +79,15 @@ program
 
 program
   .command("check")
-  .description("Check .com availability for names or a CSV file")
+  .description("Check domain availability for names or a CSV file")
   .argument("[names...]", "Names to check")
   .option("--file <csv>", "Read names from CSV (first column)")
+  .option("--tlds <tlds>", "TLDs to check (comma or space-separated, e.g. 'com,io,dev')")
   .option("--max-price <usd>", "Include purchasable domains up to this USD budget", "0")
   .option("--out <file>", "Output CSV file", "domain-check-results.csv")
   .action(async (names: string[], opts) => {
     const maxPriceUSD = parseInt(String(opts.maxPrice ?? 0));
+    const tlds = opts.tlds ? parseTlds(String(opts.tlds)) : DEFAULT_TLDS;
     const fromArgs = names.map(normalizeName).filter(Boolean);
     const fromFile = opts.file
       ? parseCsvFirstColumn(await readFile(String(opts.file), "utf8")).map(normalizeName).filter(Boolean)
@@ -87,7 +98,7 @@ program
       throw new Error("No names provided. Use positional names or --file <csv>.");
     }
 
-    const rows = await checkNames(unique, { maxPriceUSD });
+    const rows = await checkNames(unique, { maxPriceUSD, tlds });
     await persistDomainRows(rows, String(opts.out));
     printDomainRows(rows, { maxPriceUSD });
   });
@@ -99,6 +110,7 @@ program
   .option("--min <n>", "Minimum length", "4")
   .option("--max <n>", "Maximum length", "7")
   .option("--seed <words>", "Seed words (space or comma-separated)")
+  .option("--tlds <tlds>", "TLDs to check (comma or space-separated, e.g. 'com,io,dev')")
   .option("--max-price <usd>", "Include purchasable domains up to this USD budget", "0")
   .option("--out <file>", "Output CSV file", "domain-check-results.csv")
   .action(async (opts) => {
@@ -106,6 +118,7 @@ program
     const min = parseInt(String(opts.min));
     const max = parseInt(String(opts.max));
     const maxPriceUSD = parseInt(String(opts.maxPrice ?? 0));
+    const tlds = opts.tlds ? parseTlds(String(opts.tlds)) : DEFAULT_TLDS;
     const seedWords = String(opts.seed ?? "")
       .split(/[\s,]+/)
       .map((s) => s.trim())
@@ -118,8 +131,9 @@ program
     const API_BATCH = IDS_BATCH_SIZE;
     const MAX_ROUNDS = 100;
 
+    const tldLabel = tlds.map((t) => `.${t}`).join(", ");
     const budgetLabel = maxPriceUSD > 0 ? ` (budget <= USD ${maxPriceUSD})` : "";
-    process.stderr.write(chalk.dim(`Finding ${count} domains (${min}-${max} chars)${budgetLabel}...\n`));
+    process.stderr.write(chalk.dim(`Finding ${count} domains (${min}-${max} chars) [${tldLabel}]${budgetLabel}...\n`));
 
     for (let round = 1; round <= MAX_ROUNDS && found.length < count; round++) {
       const batchCount = Math.min(GEN_BATCH * Math.ceil(round / 3), 500);
@@ -137,16 +151,10 @@ program
       for (let i = 0; i < candidates.length && found.length < count; i += API_BATCH) {
         const slice = candidates.slice(i, i + API_BATCH);
         try {
-          const map = await checkDomainsViaIDS({ names: slice, maxPriceUSD });
-          for (const name of slice) {
-            const info = map.get(name);
-            if (!info) continue;
-            if (info.available) {
-              const row = toDomainRow(name, info);
-              roundRows.push(row);
-              found.push(row);
-            } else if (info.purchasable) {
-              const row = toDomainRow(name, info);
+          const map = await checkDomainsViaIDS({ names: slice, tlds, maxPriceUSD });
+          for (const [, info] of map) {
+            if (info.available || info.purchasable) {
+              const row = toDomainRow(info);
               roundRows.push(row);
               found.push(row);
             }
@@ -179,12 +187,18 @@ program.parseAsync(process.argv).catch((err: unknown) => {
   process.exitCode = 1;
 });
 
-async function checkNames(names: string[], params: { maxPriceUSD: number }): Promise<DomainRow[]> {
+async function checkNames(names: string[], params: { maxPriceUSD: number; tlds: string[] }): Promise<DomainRow[]> {
+  const { tlds, maxPriceUSD } = params;
   const chunks = chunk(names, IDS_BATCH_SIZE);
   const rows = await chunks.reduce<Promise<DomainRow[]>>(async (accP, batch, index) => {
     const acc = await accP;
-    const map = await checkDomainsViaIDS({ names: batch, maxPriceUSD: params.maxPriceUSD });
-    const batchRows = batch.map((name) => toDomainRow(name, map.get(name)));
+    const map = await checkDomainsViaIDS({ names: batch, tlds, maxPriceUSD });
+    const batchRows = batch.flatMap((name) =>
+      tlds.map((tld) => {
+        const info = map.get(`${name}.${tld}`);
+        return info ? toDomainRow(info) : toErrorRow(name, tld);
+      })
+    );
     if (index < chunks.length - 1) await delay(250);
     return [...acc, ...batchRows];
   }, Promise.resolve([]));
@@ -208,8 +222,11 @@ function printDomainRows(rows: DomainRow[], params: { maxPriceUSD: number }) {
   const taken = rows.filter((r) => r.status === "TAKEN");
   const error = rows.filter((r) => r.status === "ERROR");
 
+  const tlds = [...new Set(rows.map((r) => r.tld))];
+  const tldLabel = tlds.map((t) => `.${t}`).join(", ");
+
   if (free.length) {
-    process.stdout.write(`\nFREE .com (${free.length}):\n\n`);
+    process.stdout.write(`\nFREE (${free.length}):\n\n`);
     for (const r of free) process.stdout.write(`  ${chalk.green("+")} ${r.domain}\n`);
   }
   if (buy.length) {
@@ -226,14 +243,14 @@ function printDomainRows(rows: DomainRow[], params: { maxPriceUSD: number }) {
   }
 
   process.stdout.write(
-    `\nSummary: ${free.length} free / ${buy.length} buy / ${taken.length} taken / ${error.length} error (total ${rows.length})\n\n`
+    `\nSummary [${tldLabel}]: ${free.length} free / ${buy.length} buy / ${taken.length} taken / ${error.length} error (total ${rows.length})\n\n`
   );
 }
 
 async function persistDomainRows(rows: DomainRow[], outFile: string) {
   const csv = toCsv([
-    ["name", "domain", "status", "price_usd", "market"],
-    ...rows.map((r) => [r.name, r.domain, r.status, r.priceUSD?.toString() ?? "", r.market ?? ""]),
+    ["name", "tld", "domain", "status", "price_usd", "market"],
+    ...rows.map((r) => [r.name, r.tld, r.domain, r.status, r.priceUSD?.toString() ?? "", r.market ?? ""]),
   ]);
   await writeFile(outFile, csv, "utf8");
   process.stderr.write(chalk.dim(`Saved results to ${outFile}\n`));
@@ -250,9 +267,14 @@ function chunk<T>(items: T[], size: number): T[][] {
   return out;
 }
 
-function toDomainRow(name: string, info: { available: boolean; purchasable: boolean; priceUSD: number | null; market: string | null } | undefined): DomainRow {
-  if (!info) return { name, domain: `${name}.com`, status: "ERROR", priceUSD: null, market: null };
-  if (info.available) return { name, domain: `${name}.com`, status: "FREE", priceUSD: null, market: null };
-  if (info.purchasable) return { name, domain: `${name}.com`, status: "BUY", priceUSD: info.priceUSD, market: info.market };
-  return { name, domain: `${name}.com`, status: "TAKEN", priceUSD: info.priceUSD, market: info.market };
+function toDomainRow(info: DomainInfo): DomainRow {
+  const { name, tld } = info;
+  const domain = `${name}.${tld}`;
+  if (info.available) return { name, tld, domain, status: "FREE", priceUSD: null, market: null };
+  if (info.purchasable) return { name, tld, domain, status: "BUY", priceUSD: info.priceUSD, market: info.market };
+  return { name, tld, domain, status: "TAKEN", priceUSD: info.priceUSD, market: info.market };
+}
+
+function toErrorRow(name: string, tld: string): DomainRow {
+  return { name, tld, domain: `${name}.${tld}`, status: "ERROR", priceUSD: null, market: null };
 }
