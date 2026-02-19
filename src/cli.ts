@@ -3,6 +3,7 @@
 import { Command } from "commander";
 import chalk from "chalk";
 import { readFile, writeFile } from "node:fs/promises";
+import pkg from "../package.json";
 import { generateCandidates } from "./generator";
 import { normalizeName } from "./util";
 import { parseCsvFirstColumn, toCsv } from "./csv";
@@ -41,7 +42,7 @@ const parseTlds = (value: string): string[] =>
     .map((s) => s.trim().replace(/^\./, ""))
     .filter(Boolean);
 
-program.name("namio").description("Brandable name generator + domain availability checker").version("0.0.1");
+program.name("namio").description("Brandable name generator + domain availability checker").version(pkg.version);
 
 const IDS_BATCH_SIZE = 25;
 
