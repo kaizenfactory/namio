@@ -1,6 +1,6 @@
-export function parseCsvFirstColumn(content: string): string[] {
-  const lines = content.split("\n");
-  const rows = lines
+export const parseCsvFirstColumn = (content: string): readonly string[] => {
+  const rows = content
+    .split("\n")
     .map((l) => l.trim())
     .filter(Boolean)
     .filter((l) => !l.startsWith("#"));
@@ -14,15 +14,14 @@ export function parseCsvFirstColumn(content: string): string[] {
     .slice(startIndex)
     .map((l) => (l.split(",")[0] ?? "").trim())
     .filter(Boolean);
-}
+};
 
-export function toCsv(lines: string[][]): string {
-  return lines.map((row) => row.map(escapeCsvCell).join(",")).join("\n") + "\n";
-}
+const DQUOTE = '"';
 
-function escapeCsvCell(value: string): string {
-  if (value.includes(",") || value.includes("\"") || value.includes("\n")) {
-    return `"${value.replaceAll("\"", "\"\"")}"`;
-  }
-  return value;
-}
+const escapeCsvCell = (value: string): string =>
+  value.includes(",") || value.includes(DQUOTE) || value.includes("\n")
+    ? DQUOTE + value.replaceAll(DQUOTE, DQUOTE + DQUOTE) + DQUOTE
+    : value;
+
+export const toCsv = (lines: readonly (readonly string[])[]): string =>
+  lines.map((row) => row.map(escapeCsvCell).join(",")).join("\n") + "\n";

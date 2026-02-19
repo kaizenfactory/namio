@@ -2,39 +2,17 @@
 
 import { Command } from "commander";
 import chalk from "chalk";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import pkg from "../package.json";
-import { generateCandidates } from "./generator";
-import { normalizeName } from "./util";
+import { generateCandidates, DEFAULT_SEEDS } from "./generator";
+import { checkNames, toDomainRow, sortDomainRows, IDS_BATCH_SIZE } from "./check";
+import { printDomainRows, persistDomainRows } from "./display";
+import { checkDomainsViaIDS } from "./domain/ids";
+import { normalizeName, delay, chunk } from "./util";
 import { parseCsvFirstColumn, toCsv } from "./csv";
-import { checkDomainsViaIDS, type DomainInfo } from "./domain/ids";
+import type { DomainRow, GenerateOpts, CheckOpts, HuntOpts } from "./types";
 
-type DomainRow = {
-  name: string;
-  tld: string;
-  domain: string;
-  status: "FREE" | "BUY" | "TAKEN" | "ERROR";
-  priceUSD: number | null;
-  market: string | null;
-};
-
-const DEFAULT_SEEDS = [
-  "search",
-  "find",
-  "discover",
-  "combine",
-  "win",
-  "goal",
-  "reach",
-  "scope",
-  "spot",
-  "signal",
-  "surface",
-  "emerge",
-];
-
-const program = new Command();
-const DEFAULT_TLDS = ["com"];
+const DEFAULT_TLDS = ["com"] as const;
 
 const parseTlds = (value: string): string[] =>
   value
@@ -42,9 +20,44 @@ const parseTlds = (value: string): string[] =>
     .map((s) => s.trim().replace(/^\./, ""))
     .filter(Boolean);
 
-program.name("namio").description("Brandable name generator + domain availability checker").version(pkg.version);
+const parseSeedWords = (raw: string | undefined): readonly string[] => {
+  const words = (raw ?? "")
+    .split(/[\s,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return words.length > 0 ? words : DEFAULT_SEEDS;
+};
 
-const IDS_BATCH_SIZE = 25;
+const parseGenerateOpts = (opts: Record<string, string>): GenerateOpts => ({
+  count: parseInt(opts.count!),
+  min: parseInt(opts.min!),
+  max: parseInt(opts.max!),
+  seedWords: parseSeedWords(opts.seed),
+  out: opts.out!,
+});
+
+const parseCheckOpts = (names: readonly string[], opts: Record<string, string>): Omit<CheckOpts, "names"> & { readonly file?: string; readonly rawNames: readonly string[] } => ({
+  rawNames: names,
+  file: opts.file,
+  tlds: opts.tlds ? parseTlds(opts.tlds) : [...DEFAULT_TLDS],
+  maxPriceUSD: parseInt(opts.maxPrice ?? "0"),
+  out: opts.out!,
+});
+
+const parseHuntOpts = (opts: Record<string, string>): HuntOpts => ({
+  count: parseInt(opts.count!),
+  min: parseInt(opts.min!),
+  max: parseInt(opts.max!),
+  seedWords: parseSeedWords(opts.seed),
+  tlds: opts.tlds ? parseTlds(opts.tlds) : [...DEFAULT_TLDS],
+  maxPriceUSD: parseInt(opts.maxPrice ?? "0"),
+  out: opts.out!,
+});
+
+// --- commands ---
+
+const program = new Command();
+program.name("namio").description("Brandable name generator + domain availability checker").version(pkg.version);
 
 program
   .command("generate")
@@ -54,27 +67,16 @@ program
   .option("--max <n>", "Maximum length", "7")
   .option("--seed <words>", "Seed words (space or comma-separated)")
   .option("--out <file>", "Output CSV file", "generated-words.csv")
-  .action(async (opts) => {
-    const count = parseInt(String(opts.count));
-    const min = parseInt(String(opts.min));
-    const max = parseInt(String(opts.max));
-    const seedWords = String(opts.seed ?? "")
-      .split(/[\s,]+/)
-      .map((s) => s.trim())
-      .filter(Boolean);
-
-    const { candidates } = generateCandidates({
-      count,
-      min,
-      max,
-      seedWords: seedWords.length ? seedWords : DEFAULT_SEEDS,
-    });
-
+  .action(async (raw: Record<string, string>) => {
+    const opts = parseGenerateOpts(raw);
+    const { candidates } = generateCandidates(opts);
     const words = [...new Set(candidates)].sort();
-    for (const w of words) process.stdout.write(`${w}\n`);
+
+    process.stdout.write(words.join("\n") + "\n");
 
     const csv = toCsv([["name"], ...words.map((w) => [w])]);
-    await writeFile(String(opts.out), csv, "utf8");
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(opts.out, csv, "utf8");
     process.stderr.write(chalk.dim(`\nSaved ${words.length} to ${opts.out}\n`));
   });
 
@@ -86,12 +88,11 @@ program
   .option("--tlds <tlds>", "TLDs to check (comma or space-separated, e.g. 'com,io,dev')")
   .option("--max-price <usd>", "Include purchasable domains up to this USD budget", "0")
   .option("--out <file>", "Output CSV file", "domain-check-results.csv")
-  .action(async (names: string[], opts) => {
-    const maxPriceUSD = parseInt(String(opts.maxPrice ?? 0));
-    const tlds = opts.tlds ? parseTlds(String(opts.tlds)) : DEFAULT_TLDS;
-    const fromArgs = names.map(normalizeName).filter(Boolean);
+  .action(async (names: string[], raw: Record<string, string>) => {
+    const opts = parseCheckOpts(names, raw);
+    const fromArgs = opts.rawNames.map(normalizeName).filter(Boolean);
     const fromFile = opts.file
-      ? parseCsvFirstColumn(await readFile(String(opts.file), "utf8")).map(normalizeName).filter(Boolean)
+      ? parseCsvFirstColumn(await readFile(opts.file, "utf8")).map(normalizeName).filter(Boolean)
       : [];
 
     const unique = [...new Set([...fromFile, ...fromArgs])];
@@ -99,10 +100,93 @@ program
       throw new Error("No names provided. Use positional names or --file <csv>.");
     }
 
-    const rows = await checkNames(unique, { maxPriceUSD, tlds });
-    await persistDomainRows(rows, String(opts.out));
-    printDomainRows(rows, { maxPriceUSD });
+    const rows = await checkNames({ names: unique, tlds: opts.tlds, maxPriceUSD: opts.maxPriceUSD });
+    await persistDomainRows(rows, opts.out);
+    printDomainRows(rows, { maxPriceUSD: opts.maxPriceUSD });
   });
+
+const GEN_BATCH = 120;
+const MAX_ROUNDS = 100;
+const MAX_GEN_PER_ROUND = 500;
+const INTER_BATCH_DELAY_MS = 150;
+const INTER_ROUND_DELAY_MS = 200;
+const ERROR_RETRY_DELAY_MS = 1000;
+
+const runHuntRound = async (params: {
+  readonly round: number;
+  readonly opts: HuntOpts;
+  readonly seen: Set<string>;
+  readonly found: readonly DomainRow[];
+}): Promise<readonly DomainRow[]> => {
+  const { round, opts, seen, found } = params;
+  if (round > MAX_ROUNDS || found.length >= opts.count) return found;
+
+  const batchCount = Math.min(GEN_BATCH * Math.ceil(round / 3), MAX_GEN_PER_ROUND);
+  const { candidates } = generateCandidates({
+    count: batchCount,
+    min: opts.min,
+    max: opts.max,
+    seedWords: opts.seedWords,
+    seen,
+  });
+
+  if (candidates.length === 0) return found;
+
+  const batches = chunk(candidates, IDS_BATCH_SIZE);
+  const { newRows, done } = await processHuntBatches({
+    batches,
+    tlds: opts.tlds,
+    maxPriceUSD: opts.maxPriceUSD,
+    remaining: opts.count - found.length,
+    round,
+  });
+
+  const updatedFound = [...found, ...newRows];
+
+  process.stderr.write(
+    chalk.dim(
+      `Round ${String(round).padStart(2)}: generated ${String(candidates.length).padStart(3)} -> ${String(newRows.length).padStart(2)} found (total ${updatedFound.length}/${opts.count})\n`
+    )
+  );
+
+  if (done || updatedFound.length >= opts.count) return updatedFound;
+
+  await delay(INTER_ROUND_DELAY_MS);
+  return runHuntRound({ round: round + 1, opts, seen, found: updatedFound });
+};
+
+const processHuntBatches = async (params: {
+  readonly batches: readonly (readonly string[])[];
+  readonly tlds: readonly string[];
+  readonly maxPriceUSD: number;
+  readonly remaining: number;
+  readonly round: number;
+  readonly index?: number;
+  readonly acc?: readonly DomainRow[];
+}): Promise<{ readonly newRows: readonly DomainRow[]; readonly done: boolean }> => {
+  const { batches, tlds, maxPriceUSD, remaining, round, index = 0, acc = [] } = params;
+
+  if (index >= batches.length || acc.length >= remaining) {
+    return { newRows: acc, done: acc.length >= remaining };
+  }
+
+  try {
+    const map = await checkDomainsViaIDS({ names: batches[index]!, tlds, maxPriceUSD });
+    const hits = [...map.values()]
+      .filter((info) => info.available || info.purchasable)
+      .map(toDomainRow);
+    const taken = [...acc, ...hits].slice(0, remaining);
+
+    if (index + 1 < batches.length) await delay(INTER_BATCH_DELAY_MS);
+
+    return processHuntBatches({ ...params, index: index + 1, acc: taken });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    process.stderr.write(chalk.yellow(`IDS API error (round ${round}): ${msg}\n`));
+    await delay(ERROR_RETRY_DELAY_MS);
+    return processHuntBatches({ ...params, index: index + 1, acc });
+  }
+};
 
 program
   .command("hunt")
@@ -114,72 +198,16 @@ program
   .option("--tlds <tlds>", "TLDs to check (comma or space-separated, e.g. 'com,io,dev')")
   .option("--max-price <usd>", "Include purchasable domains up to this USD budget", "0")
   .option("--out <file>", "Output CSV file", "domain-check-results.csv")
-  .action(async (opts) => {
-    const count = parseInt(String(opts.count));
-    const min = parseInt(String(opts.min));
-    const max = parseInt(String(opts.max));
-    const maxPriceUSD = parseInt(String(opts.maxPrice ?? 0));
-    const tlds = opts.tlds ? parseTlds(String(opts.tlds)) : DEFAULT_TLDS;
-    const seedWords = String(opts.seed ?? "")
-      .split(/[\s,]+/)
-      .map((s) => s.trim())
-      .filter(Boolean);
+  .action(async (raw: Record<string, string>) => {
+    const opts = parseHuntOpts(raw);
+    const tldLabel = opts.tlds.map((t) => `.${t}`).join(", ");
+    const budgetLabel = opts.maxPriceUSD > 0 ? ` (budget <= USD ${opts.maxPriceUSD})` : "";
+    process.stderr.write(chalk.dim(`Finding ${opts.count} domains (${opts.min}-${opts.max} chars) [${tldLabel}]${budgetLabel}...\n`));
 
-    const seen = new Set<string>();
-    const found: DomainRow[] = [];
-
-    const GEN_BATCH = 120;
-    const API_BATCH = IDS_BATCH_SIZE;
-    const MAX_ROUNDS = 100;
-
-    const tldLabel = tlds.map((t) => `.${t}`).join(", ");
-    const budgetLabel = maxPriceUSD > 0 ? ` (budget <= USD ${maxPriceUSD})` : "";
-    process.stderr.write(chalk.dim(`Finding ${count} domains (${min}-${max} chars) [${tldLabel}]${budgetLabel}...\n`));
-
-    for (let round = 1; round <= MAX_ROUNDS && found.length < count; round++) {
-      const batchCount = Math.min(GEN_BATCH * Math.ceil(round / 3), 500);
-      const { candidates } = generateCandidates({
-        count: batchCount,
-        min,
-        max,
-        seedWords: seedWords.length ? seedWords : DEFAULT_SEEDS,
-        seen,
-      });
-
-      if (candidates.length === 0) break;
-
-      const roundRows: DomainRow[] = [];
-      for (let i = 0; i < candidates.length && found.length < count; i += API_BATCH) {
-        const slice = candidates.slice(i, i + API_BATCH);
-        try {
-          const map = await checkDomainsViaIDS({ names: slice, tlds, maxPriceUSD });
-          for (const [, info] of map) {
-            if (info.available || info.purchasable) {
-              const row = toDomainRow(info);
-              roundRows.push(row);
-              found.push(row);
-            }
-            if (found.length >= count) break;
-          }
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          process.stderr.write(chalk.yellow(`IDS API error (round ${round}): ${msg}\n`));
-          await delay(1000);
-        }
-        if (i + API_BATCH < candidates.length) await delay(150);
-      }
-
-      process.stderr.write(
-        chalk.dim(
-          `Round ${String(round).padStart(2)}: generated ${String(candidates.length).padStart(3)} -> ${String(roundRows.length).padStart(2)} found (total ${found.length}/${count})\n`
-        )
-      );
-      await delay(200);
-    }
-
+    const found = await runHuntRound({ round: 1, opts, seen: new Set(), found: [] });
     const rows = sortDomainRows(found);
-    await persistDomainRows(rows, String(opts.out));
-    printDomainRows(rows, { maxPriceUSD });
+    await persistDomainRows(rows, opts.out);
+    printDomainRows(rows, { maxPriceUSD: opts.maxPriceUSD });
   });
 
 program.parseAsync(process.argv).catch((err: unknown) => {
@@ -187,95 +215,3 @@ program.parseAsync(process.argv).catch((err: unknown) => {
   process.stderr.write(chalk.red(`Error: ${message}\n`));
   process.exitCode = 1;
 });
-
-async function checkNames(names: string[], params: { maxPriceUSD: number; tlds: string[] }): Promise<DomainRow[]> {
-  const { tlds, maxPriceUSD } = params;
-  const chunks = chunk(names, IDS_BATCH_SIZE);
-  const rows = await chunks.reduce<Promise<DomainRow[]>>(async (accP, batch, index) => {
-    const acc = await accP;
-    const map = await checkDomainsViaIDS({ names: batch, tlds, maxPriceUSD });
-    const batchRows = batch.flatMap((name) =>
-      tlds.map((tld) => {
-        const info = map.get(`${name}.${tld}`);
-        return info ? toDomainRow(info) : toErrorRow(name, tld);
-      })
-    );
-    if (index < chunks.length - 1) await delay(250);
-    return [...acc, ...batchRows];
-  }, Promise.resolve([]));
-
-  return sortDomainRows(rows);
-}
-
-function sortDomainRows(rows: DomainRow[]): DomainRow[] {
-  const free = rows.filter((r) => r.status === "FREE").sort((a, b) => a.name.localeCompare(b.name));
-  const buy = rows
-    .filter((r) => r.status === "BUY")
-    .sort((a, b) => (a.priceUSD ?? Number.MAX_SAFE_INTEGER) - (b.priceUSD ?? Number.MAX_SAFE_INTEGER));
-  const taken = rows.filter((r) => r.status === "TAKEN").sort((a, b) => a.name.localeCompare(b.name));
-  const error = rows.filter((r) => r.status === "ERROR").sort((a, b) => a.name.localeCompare(b.name));
-  return [...free, ...buy, ...taken, ...error];
-}
-
-function printDomainRows(rows: DomainRow[], params: { maxPriceUSD: number }) {
-  const free = rows.filter((r) => r.status === "FREE");
-  const buy = rows.filter((r) => r.status === "BUY");
-  const taken = rows.filter((r) => r.status === "TAKEN");
-  const error = rows.filter((r) => r.status === "ERROR");
-
-  const tlds = [...new Set(rows.map((r) => r.tld))];
-  const tldLabel = tlds.map((t) => `.${t}`).join(", ");
-
-  if (free.length) {
-    process.stdout.write(`\nFREE (${free.length}):\n\n`);
-    for (const r of free) process.stdout.write(`  ${chalk.green("+")} ${r.domain}\n`);
-  }
-  if (buy.length) {
-    process.stdout.write(`\nBUY (<= USD ${params.maxPriceUSD}) (${buy.length}):\n\n`);
-    for (const r of buy) process.stdout.write(`  ${chalk.yellow("$")} ${r.domain} - USD ${r.priceUSD ?? "?"} (${r.market ?? "?"})\n`);
-  }
-  if (taken.length) {
-    process.stdout.write(`\nTAKEN (${taken.length}):\n\n`);
-    for (const r of taken) process.stdout.write(`  ${chalk.gray("-")} ${r.domain}\n`);
-  }
-  if (error.length) {
-    process.stdout.write(`\nERROR (${error.length}):\n\n`);
-    for (const r of error) process.stdout.write(`  ${chalk.red("!")} ${r.domain}\n`);
-  }
-
-  process.stdout.write(
-    `\nSummary [${tldLabel}]: ${free.length} free / ${buy.length} buy / ${taken.length} taken / ${error.length} error (total ${rows.length})\n\n`
-  );
-}
-
-async function persistDomainRows(rows: DomainRow[], outFile: string) {
-  const csv = toCsv([
-    ["name", "tld", "domain", "status", "price_usd", "market"],
-    ...rows.map((r) => [r.name, r.tld, r.domain, r.status, r.priceUSD?.toString() ?? "", r.market ?? ""]),
-  ]);
-  await writeFile(outFile, csv, "utf8");
-  process.stderr.write(chalk.dim(`Saved results to ${outFile}\n`));
-}
-
-function delay(ms: number) {
-  return new Promise<void>((resolve) => setTimeout(resolve, ms));
-}
-
-function chunk<T>(items: T[], size: number): T[][] {
-  if (size <= 0) return [items];
-  const out: T[][] = [];
-  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
-  return out;
-}
-
-function toDomainRow(info: DomainInfo): DomainRow {
-  const { name, tld } = info;
-  const domain = `${name}.${tld}`;
-  if (info.available) return { name, tld, domain, status: "FREE", priceUSD: null, market: null };
-  if (info.purchasable) return { name, tld, domain, status: "BUY", priceUSD: info.priceUSD, market: info.market };
-  return { name, tld, domain, status: "TAKEN", priceUSD: info.priceUSD, market: info.market };
-}
-
-function toErrorRow(name: string, tld: string): DomainRow {
-  return { name, tld, domain: `${name}.${tld}`, status: "ERROR", priceUSD: null, market: null };
-}
