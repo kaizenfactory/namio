@@ -1,44 +1,92 @@
 export type IDSMarket = {
-  market: string;
-  price: number | null; // cents (USD)
-  min_price: number | null;
-  type: string;
+  readonly market: string;
+  readonly price: number | null;
+  readonly min_price: number | null;
+  readonly type: string;
 };
 
 export type IDSResult = {
-  isRegistered: boolean | null;
-  label: string;
-  tld: string;
-  czdap: boolean;
-  securityTrails: boolean;
-  markets: IDSMarket[];
-  etldCount: number | null;
-  [key: string]: unknown;
+  readonly isRegistered: boolean | null;
+  readonly label: string;
+  readonly tld: string;
+  readonly czdap: boolean;
+  readonly securityTrails: boolean;
+  readonly markets: readonly IDSMarket[];
+  readonly etldCount: number | null;
 };
 
 export type DomainInfo = {
-  name: string;
-  tld: string;
-  available: boolean;
-  purchasable: boolean;
-  priceUSD: number | null;
-  market: string | null;
+  readonly name: string;
+  readonly tld: string;
+  readonly available: boolean;
+  readonly purchasable: boolean;
+  readonly priceUSD: number | null;
+  readonly market: string | null;
 };
 
-export function idsHashCode(name: string, seed: number = 42): string {
-  let r = seed;
-  for (const ch of name) {
-    r = (r << 5) - r + (ch.codePointAt(0) ?? 0);
-    r &= r;
-  }
-  return String(r);
-}
+const REQUEST_TIMEOUT_MS = 15_000;
 
-export async function checkDomainsViaIDS(params: {
-  names: string[];
-  tlds?: string[];
-  maxPriceUSD: number;
-}): Promise<Map<string, DomainInfo>> {
+const idsHashCode = (name: string, seed: number = 42): string => {
+  const hash = [...name].reduce(
+    (r, ch) => ((r << 5) - r + (ch.codePointAt(0) ?? 0)) | 0,
+    seed
+  );
+  return String(hash);
+};
+
+const findCheapest = (
+  markets: readonly IDSMarket[]
+): { readonly usd: number | null; readonly market: string | null } =>
+  markets.reduce<{ readonly usd: number | null; readonly market: string | null }>(
+    (best, m) => {
+      const cents = m.price ?? m.min_price ?? null;
+      if (cents === null) return best;
+      const dollars = cents / 100;
+      return best.usd === null || dollars < best.usd
+        ? { usd: dollars, market: m.market }
+        : best;
+    },
+    { usd: null, market: null }
+  );
+
+const toDomainInfo = (r: IDSResult, maxPriceUSD: number): DomainInfo => {
+  // "available" requires multiple signals to agree — isRegistered alone is unreliable
+  // because IDS sometimes returns isRegistered=false for domains that are actually taken
+  const isFree = r.isRegistered === false && !r.czdap && !r.securityTrails;
+  const cheapest = findCheapest(r.markets);
+  const purchasable = !isFree && cheapest.usd !== null && cheapest.usd <= maxPriceUSD;
+
+  return {
+    name: r.label,
+    tld: r.tld,
+    available: isFree,
+    purchasable,
+    priceUSD: cheapest.usd,
+    market: cheapest.market,
+  };
+};
+
+// IDS requires browser-like headers — requests with generic User-Agent are blocked
+const IDS_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:147.0) Gecko/20100101 Firefox/147.0",
+  Accept: "application/json",
+  "Accept-Language": "en",
+  Referer: "https://instantdomainsearch.com/",
+  "content-type": "application/json",
+  Origin: "https://instantdomainsearch.com",
+  "Sec-GPC": "1",
+  "Alt-Used": "cloud.instantdomainsearch.com",
+  "Sec-Fetch-Dest": "empty",
+  "Sec-Fetch-Mode": "cors",
+  "Sec-Fetch-Site": "same-site",
+} as const;
+
+export const checkDomainsViaIDS = async (params: {
+  readonly names: readonly string[];
+  readonly tlds?: readonly string[];
+  readonly maxPriceUSD: number;
+}): Promise<ReadonlyMap<string, DomainInfo>> => {
   const { names, tlds = ["com"], maxPriceUSD } = params;
 
   const payload = {
@@ -51,21 +99,9 @@ export async function checkDomainsViaIDS(params: {
 
   const res = await fetch("https://cloud.instantdomainsearch.com/services/query-dns", {
     method: "POST",
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:147.0) Gecko/20100101 Firefox/147.0",
-      Accept: "application/json",
-      "Accept-Language": "en",
-      Referer: "https://instantdomainsearch.com/",
-      "content-type": "application/json",
-      Origin: "https://instantdomainsearch.com",
-      "Sec-GPC": "1",
-      "Alt-Used": "cloud.instantdomainsearch.com",
-      "Sec-Fetch-Dest": "empty",
-      "Sec-Fetch-Mode": "cors",
-      "Sec-Fetch-Site": "same-site"
-    },
+    headers: IDS_HEADERS,
     body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
 
   if (!res.ok) {
@@ -73,40 +109,11 @@ export async function checkDomainsViaIDS(params: {
     throw new Error(`IDS API error: ${res.status} ${res.statusText}${body ? ` — ${body}` : ""}`);
   }
 
-  const data = (await res.json()) as { results: IDSResult[] };
-  const result = new Map<string, DomainInfo>();
+  const data = (await res.json()) as { readonly results: readonly IDSResult[] };
 
-  for (const r of data.results) {
-    if (!tlds.includes(r.tld)) continue;
-
-    // "available" only when multiple signals agree. `isRegistered=false` alone is unreliable.
-    const isFree = r.isRegistered === false && !r.czdap && !r.securityTrails;
-
-    let cheapestUSD: number | null = null;
-    let cheapestMarket: string | null = null;
-
-    for (const m of r.markets ?? []) {
-      const cents = m.price ?? m.min_price ?? null;
-      if (cents === null) continue;
-      const dollars = cents / 100;
-      if (cheapestUSD === null || dollars < cheapestUSD) {
-        cheapestUSD = dollars;
-        cheapestMarket = m.market;
-      }
-    }
-
-    const purchasable = !isFree && cheapestUSD !== null && cheapestUSD <= maxPriceUSD;
-
-    const key = `${r.label}.${r.tld}`;
-    result.set(key, {
-      name: r.label,
-      tld: r.tld,
-      available: isFree,
-      purchasable,
-      priceUSD: cheapestUSD,
-      market: cheapestMarket,
-    });
-  }
-
-  return result;
-}
+  return new Map(
+    data.results
+      .filter((r) => tlds.includes(r.tld))
+      .map((r) => [`${r.label}.${r.tld}`, toDomainInfo(r, maxPriceUSD)] as const)
+  );
+};
