@@ -1,5 +1,3 @@
-export type CsvRow = Record<string, string>;
-
 export function parseCsvFirstColumn(content: string): string[] {
   const lines = content.split("\n");
   const rows = lines
