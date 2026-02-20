@@ -15,10 +15,3 @@ export const normalizeName = (raw: string): string =>
 
 export const delay = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
-
-export const chunk = <T>(xs: readonly T[], n: number): T[][] =>
-  n <= 0 || xs.length === 0
-    ? xs.length === 0
-      ? []
-      : [[...xs]]
-    : [xs.slice(0, n) as T[], ...chunk(xs.slice(n), n)];
