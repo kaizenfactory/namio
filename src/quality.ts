@@ -46,8 +46,9 @@ const scanChar = (state: ScanState, ch: string): ScanState => {
   return { cRun, vRun, prevCh: ch, sameRun, transitions, failed };
 };
 
-export const isQuality = (word: string, min: number, max: number): boolean => {
-  if (word.length < min || word.length > max) return false;
+/** Check phonotactic quality only — length filtering is the caller's responsibility. */
+export const isQuality = (word: string): boolean => {
+  if (word.length < 2) return false;
   if (![...word].some(isVowel)) return false;
   if (BAD_STARTS.some((b) => word.startsWith(b))) return false;
 
